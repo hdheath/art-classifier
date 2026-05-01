@@ -1,0 +1,55 @@
+name: flair_gen
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.11
+
+  # Core scientific computing
+  - numpy>=1.24.0
+  - pandas>=2.0.0
+  - scipy>=1.10.0
+  - pyarrow>=12.0.0
+
+  # Genomics tools
+  - pysam>=0.21.0
+  - samtools>=1.17
+  - bedtools>=2.30.0
+  - tabix
+  - htslib
+
+  # Deep learning (GPU-enabled version)
+  - pytorch>=2.0.0
+  - torchvision>=0.15.0
+  - pytorch-cuda=11.8  # Use 12.1 if your system has CUDA 12.x
+
+  # Visualization
+  - matplotlib>=3.7.0
+  - seaborn>=0.12.0
+  - plotly>=5.14.0
+
+  # Utilities
+  - tqdm>=4.65.0
+  - pyyaml>=6.0
+
+  # Development tools
+  - pytest>=7.3.0
+  - pytest-cov>=4.1.0
+  - black
+  - flake8
+  - ipython
+  - jupyter
+
+  # Additional genomics (optional but useful)
+  - pyranges
+
+  # pip packages (not available in conda or need specific versions)
+  - pip
+  - pip:
+    # Any pip-only packages go here
+    - pyliftover  # For hg19->hg38 liftover in Python
