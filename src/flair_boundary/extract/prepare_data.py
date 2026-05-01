@@ -60,9 +60,18 @@ def parse_args():
 
     # TSS inputs
     p.add_argument("--fantom",
-                   help="FANTOM TSS BED file (hg38)")
-    p.add_argument("--reftss",
-                   help="refTSS BED file (hg38)")
+                   help="FANTOM permissive CAGE peaks BED9 (hg38). Used as the "
+                        "primary positives source. Must be verified hg38 — see "
+                        "qc/database_qc_report.md for the build audit.")
+    p.add_argument("--fantom-fair",
+                   help="FANTOM5 hg38 'fair' robust CAGE peaks BED9 (hg38-native, "
+                        "from Lizio et al. 2017). Used as the width target via "
+                        "spatial overlap with FANTOM positives — peaks that fall "
+                        "inside a fair cluster inherit the cluster's width "
+                        "(end-start) as the regression target.")
+    p.add_argument("--fantom-fair-max-width", type=int, default=5000,
+                   help="Drop fair-peak clusters wider than this (bp) — guards "
+                        "against rare liftOver pathologies.")
 
     # TTS inputs
     p.add_argument("--polyadb",
@@ -102,35 +111,43 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 def load_fantom_tss(bed_file: str, min_score: float = 0) -> pd.DataFrame:
-    """Load FANTOM TSS BED (BED9, hg38).
+    """Load FANTOM permissive CAGE peaks BED9 (hg38).
 
-    Boundary coordinate is the **peak summit** (BED `thickStart`), not the
-    interval edge. CAGE peaks span 5–50bp; using `start`/`end-1` biases the
-    label away from the actual TSS by half the peak width.
+    Used as the primary positives source for the boundary classifier.
+    Width labels are NOT assigned here — they come from the
+    FANTOM5-hg38 fair-peaks spatial join in :func:`assign_width_labels`.
+
+    IMPORTANT: this loader assumes the BED is hg38. The FANTOM5 permissive
+    peak file as distributed (FANTOM_TSS_human.bed) is **hg19**; the build
+    audit (qc/database_qc_report.md) confirmed every gene-anchored peak
+    in the original file landed in hg19 windows. The hg38 version we use
+    is produced by ``liftOver FANTOM_TSS_human.bed hg19ToHg38.over.chain
+    FANTOM_TSS_human.hg38.bed``.
+
+    Boundary coordinate: BED `start` for `+` strand, `end-1` for `-`
+    strand. (`thickStart == start` for every row in this file, so there
+    is no separate summit annotation to use.)
     """
     print(f"  Loading FANTOM TSS: {bed_file}")
-    # NOTE: comment="#" — the previous comment="t" silently dropped any line
-    # whose first character was 't'. Skip the optional "track ..." header
-    # explicitly with skiprows-on-error.
-    try:
-        df = pd.read_csv(
-            bed_file, sep="\t", header=None, comment="#",
-            names=["chrom", "start", "end", "name", "score", "strand",
-                   "thickStart", "thickEnd", "rgb"],
-        )
-    except pd.errors.ParserError:
-        df = pd.read_csv(
-            bed_file, sep="\t", header=None, comment="#", skiprows=1,
-            names=["chrom", "start", "end", "name", "score", "strand",
-                   "thickStart", "thickEnd", "rgb"],
-        )
-    # Drop any leftover header rows (defensive)
-    df = df[df["start"].apply(lambda x: str(x).isdigit())]
-    df[["start", "end", "thickStart", "thickEnd"]] = df[
-        ["start", "end", "thickStart", "thickEnd"]
-    ].astype(int)
+    df = pd.read_csv(
+        bed_file, sep="\t", header=None, skiprows=0,
+        usecols=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        names=["chrom", "start", "end", "name", "score", "strand",
+               "thickStart", "thickEnd", "rgb"],
+        dtype={"chrom": str, "start": int, "end": int, "name": str,
+               "score": str, "strand": str,
+               "thickStart": int, "thickEnd": int, "rgb": str},
+    )
 
-    # Parse confidence from name "p1@GENE,0.1352"
+    # Drop liftOver-pathology rows (peaks that ballooned to >500bp during
+    # the hg19->hg38 lift; the 99th percentile of legitimate FANTOM peaks
+    # is 59bp).
+    n_before = len(df)
+    df = df[(df["end"] - df["start"]).clip(lower=1) <= 500].reset_index(drop=True)
+    if len(df) < n_before:
+        print(f"    Dropped {n_before - len(df)} rows >500bp (liftOver pathologies)")
+
+    # Parse confidence from name field "p1@GENE,0.1352"
     def parse_conf(name):
         if "," in str(name):
             try:
@@ -143,38 +160,112 @@ def load_fantom_tss(bed_file: str, min_score: float = 0) -> pd.DataFrame:
     if min_score > 0:
         df = df[df["conf"] >= min_score]
 
-    # Use BED `thickStart` as the peak summit — strand-aware: thickStart is
-    # already the dominant TSS position for the peak and is the same field
-    # used by FANTOM's own tools.
-    df["pos"] = df["thickStart"].astype(int)
+    # Strand-aware boundary coordinate
+    df["pos"] = np.where(df["strand"] == "+", df["start"], df["end"] - 1).astype(int)
     df["score"] = (df["conf"] * 1000).astype(int)
     df["label"] = 1
-    # Peak width (end - start) — used as a regression target for width prediction.
-    # FANTOM CAGE peak width reflects the breadth of the initiation zone:
-    # narrow (TATA-driven, sharp) vs. broad (CpG-island promoters).
-    df["width"] = (df["end"].astype(int) - df["start"].astype(int)).clip(lower=1)
-    print(f"    → {len(df):,} sites (using thickStart summit, "
-          f"median width={df['width'].median():.0f}bp)")
-    return df[["chrom", "pos", "strand", "score", "label", "width"]]
+    print(f"    → {len(df):,} sites (strand-aware BED edge)")
+    return df[["chrom", "pos", "strand", "score", "label"]]
 
 
-def load_reftss(bed_file: str) -> pd.DataFrame:
-    """Load refTSS BED (hg38, tab-separated with header).
+def load_cage_cluster_bed(
+    bed_file: str,
+    max_width: int = 5000,
+) -> pd.DataFrame:
+    """Load a generic merged CAGE cluster BED (hg38) for use as the
+    width-target source.
 
-    Boundary coordinate is the **interval midpoint**, not the strand-edge.
-    refTSS peaks are 50–500bp wide and there is no annotated summit — the
-    midpoint is the least-biased point estimate.
+    Currently used with the Lizio et al. 2017 ``hg38_fair_CAGE_peaks_phase1and2.bed``
+    file (the FANTOM5 hg38-native robust set). Each row is a merged CAGE
+    cluster with strand. The per-cluster width
+    (`end - start`) is the regression target for the TSS width head: it
+    represents the empirically-observed breadth of the initiation zone for
+    each promoter.
+
+    Filters out clusters wider than ``max_width`` bp to drop liftOver
+    pathologies (one cluster lifted to 2.45 Mb in QC).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: chrom, start, end, strand, width.
     """
-    print(f"  Loading refTSS: {bed_file}")
-    df = pd.read_csv(bed_file, sep="\t")
-    df = df.rename(columns={"chromosome": "chrom", "refTSS_ID": "name"})
-    df["pos"] = ((df["start"].astype(int) + df["end"].astype(int)) // 2).astype(int)
-    df["score"] = 1000  # All refTSS are high-confidence
-    df["label"] = 1
+    print(f"  Loading CAGE cluster BED: {bed_file}")
+    df = pd.read_csv(
+        bed_file, sep="\t", header=None,
+        usecols=[0, 1, 2, 3, 4, 5],
+        names=["chrom", "start", "end", "name", "score", "strand"],
+        dtype={"chrom": str, "start": int, "end": int,
+               "name": str, "score": str, "strand": str},
+    )
+    n_before = len(df)
     df["width"] = (df["end"].astype(int) - df["start"].astype(int)).clip(lower=1)
-    print(f"    → {len(df):,} sites (using interval midpoint, "
-          f"median width={df['width'].median():.0f}bp)")
-    return df[["chrom", "pos", "strand", "score", "label", "width"]]
+    df = df[df["width"] <= max_width].reset_index(drop=True)
+    n_dropped = n_before - len(df)
+    print(
+        f"    → {len(df):,} clusters "
+        f"({n_dropped} dropped as >{max_width}bp liftOver outliers); "
+        f"width median={int(df['width'].median())}bp, "
+        f"p90={int(df['width'].quantile(0.9))}bp, "
+        f"p99={int(df['width'].quantile(0.99))}bp, "
+        f"max={int(df['width'].max())}bp"
+    )
+    return df[["chrom", "start", "end", "strand", "width"]]
+
+
+def assign_width_labels(
+    positives: pd.DataFrame,
+    cat_clusters: pd.DataFrame,
+) -> pd.DataFrame:
+    """Assign FANTOM-CAT cluster widths to TSS positives via spatial overlap.
+
+    For each positive (chrom, pos, strand), find the FANTOM-CAT cluster on
+    the same chrom+strand whose interval ``[start, end)`` contains pos.
+    If multiple clusters overlap, take the narrowest (most specific). If
+    none overlap, the width label is NaN — those rows stay positives for
+    the classifier but are excluded from width-regressor training.
+
+    The implementation uses ``np.searchsorted`` against per-(chrom, strand)
+    sorted start/end arrays — O(N log M) total instead of the O(N·M)
+    pairwise comparison.
+    """
+    print(f"  Assigning width labels via FANTOM-CAT spatial overlap...")
+    pos = positives.reset_index(drop=True).copy()
+    pos["width"] = np.nan
+
+    # Build per-(chrom, strand) sorted arrays
+    cat_index = {}
+    for (chrom, strand), grp in cat_clusters.groupby(["chrom", "strand"]):
+        order = np.argsort(grp["start"].values)
+        cat_index[(chrom, strand)] = {
+            "start": grp["start"].values[order],
+            "end":   grp["end"].values[order],
+            "width": grp["width"].values[order],
+        }
+
+    n_assigned = 0
+    for (chrom, strand), grp in pos.groupby(["chrom", "strand"]):
+        idx = cat_index.get((chrom, strand))
+        if idx is None:
+            continue
+        positions = grp["pos"].values
+        # candidate cluster i is one whose start <= pos
+        cand = np.searchsorted(idx["start"], positions, side="right") - 1
+        in_range = (cand >= 0) & (cand < len(idx["start"])) & (idx["end"][np.clip(cand, 0, len(idx["end"])-1)] > positions)
+        # NB: this finds the rightmost cluster whose start<=pos.
+        # If clusters are non-overlapping (the FANTOM-CAT case), this is
+        # also the unique containing cluster.
+        widths = np.where(in_range, idx["width"][np.clip(cand, 0, len(idx["width"])-1)], np.nan)
+        pos.loc[grp.index, "width"] = widths
+        n_assigned += int(np.isfinite(widths).sum())
+
+    n_total = len(pos)
+    print(
+        f"    → {n_assigned:,} / {n_total:,} positives assigned a width label "
+        f"({100*n_assigned/max(n_total,1):.1f}%); "
+        f"the rest stay positives but are excluded from the width regressor."
+    )
+    return pos
 
 
 def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
@@ -193,9 +284,6 @@ def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
         lambda r: r["end"] - 1 if r["strand"] == "+" else r["start"], axis=1
     )
     df["label"] = 1
-    # Peak width — typically narrow for polyA sites (often 1bp), but some
-    # broad clusters exist. Used as a regression target.
-    df["width"] = (df["end"].astype(int) - df["start"].astype(int)).clip(lower=1)
 
     if pas_file:
         print(f"  Merging PAS annotations from: {pas_file}")
@@ -207,7 +295,11 @@ def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
             "Intron/exon location": "intron_exon_loc",
             "PSE": "pse",
         })
-        # Weight by PAS signal type
+        # PolyA_DB writes signal names with the RNA letter U (AAUAAA);
+        # map to DNA spelling so the lookup actually matches.
+        pas_df["pas_signal"] = (
+            pas_df["pas_signal"].astype(str).str.replace("U", "T", regex=False)
+        )
         signal_weights = {
             "AATAAA": 1000,
             "ATTAAA":  800,
@@ -229,11 +321,13 @@ def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
         df = df.merge(pas_df[merge_cols], on="name", how="left", validate="many_to_one")
         df["score"] = df["pas_score"].fillna(df["score"]).astype(int)
 
-    print(f"    → {len(df):,} sites (median width={df['width'].median():.0f}bp)")
+    print(f"    → {len(df):,} sites (1bp resolution; no width target)")
     # NOTE: intron_exon_loc and pse columns from polyAdb are NOT included
     # in the training feature set — they cause label leakage because they
     # are only non-zero for positive sites (from the database).
-    return df[["chrom", "pos", "strand", "score", "label", "width"]]
+    # PolyA_DB is single-bp resolution so no `width` column is returned —
+    # the width regressor only trains on TSS positives.
+    return df[["chrom", "pos", "strand", "score", "label"]]
 
 
 # ---------------------------------------------------------------------------
@@ -557,11 +651,8 @@ def main():
         if args.fantom:
             df_f = load_fantom_tss(args.fantom, args.min_score)
             positive_dfs.append(df_f)
-        if args.reftss:
-            df_r = load_reftss(args.reftss)
-            positive_dfs.append(df_r)
         if not positive_dfs:
-            print("ERROR: No TSS input files provided (--fantom or --reftss required)")
+            print("ERROR: No TSS input files provided (--fantom required)")
             sys.exit(1)
     else:  # tts
         if args.polyadb:
@@ -586,6 +677,21 @@ def main():
     if args.max_sites and len(positives) > args.max_sites:
         positives = positives.sample(args.max_sites, random_state=args.seed)
         print(f"  Subsampled to {len(positives):,} sites")
+
+    # --- Assign width labels via FANTOM5-hg38 fair peaks (TSS only) ---
+    if args.type == "tss" and getattr(args, "fantom_fair", None):
+        if not Path(args.fantom_fair).exists():
+            print(f"  WARNING: --fantom-fair path does not exist: {args.fantom_fair}; "
+                  f"width regressor will have no labels")
+            positives["width"] = np.nan
+        else:
+            fair_clusters = load_cage_cluster_bed(
+                args.fantom_fair, max_width=args.fantom_fair_max_width,
+            )
+            positives = assign_width_labels(positives, fair_clusters)
+    else:
+        # TTS has no width target (PolyA_DB is single-bp)
+        positives["width"] = np.nan
 
     # NOTE on negative generation: negatives are placed ≥neg_min_dist from any
     # positive. This means ctx_is_clustered and ctx_n_within_500bp will be
@@ -732,3 +838,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 

@@ -25,7 +25,8 @@ model_weights/**/*.tsv
 # Logs and intermediate outputs
 # ---------------------------------------------------------------------------
 logs/
-qc/
+/qc/                # top-level qc/ output dir is auto-generated...
+!/qc/database_qc_report.md   # ...but track the QC report itself
 *.log
 *.out
 *.err

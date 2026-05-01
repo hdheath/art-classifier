@@ -38,9 +38,13 @@ MERGE_WINDOW=25
 # Project paths
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GENOME="${PROJ_DIR}/data/ref/GRCh38.primary_assembly.genome.fa"
-GTF="${PROJ_DIR}/data/ref/gencode.v48.annotation.gtf"
-FANTOM_TSS="${PROJ_DIR}/TSS_db/FANTOM_TSS_human.bed"
-REFTSS="${PROJ_DIR}/TSS_db/refTSS_v4.1_human_coordinate.hg38.bed.txt"
+GTF="${PROJ_DIR}/data/ref/gencode.v49.basic.annotation.gtf"
+# FANTOM_TSS: the verified-hg38 (re-lifted) permissive peaks. NEVER use the
+# original FANTOM_TSS_human.bed — that file is hg19 (build audit Apr 2026).
+FANTOM_TSS="${PROJ_DIR}/TSS_db/FANTOM_TSS_human.hg38.bed"
+# FANTOM_FAIR: hg38-native robust merged CAGE clusters (Lizio et al. 2017).
+# Used as the width-target source via spatial overlap with positives.
+FANTOM_FAIR="${PROJ_DIR}/TSS_db/fantom5_hg38/hg38_fair_CAGE_peaks_phase1and2.bed"
 POLYADB="${PROJ_DIR}/TTS_db/polyadb.hg38.weighted.bed"
 POLYADB_PAS="${PROJ_DIR}/TTS_db/polyAdb_human.PAS.txt"
 
@@ -134,14 +138,20 @@ run_type() {
         fi
 
         if [ "${btype}" == "tss" ]; then
-            prepare_args+=(--fantom "${FANTOM_TSS}" --reftss "${REFTSS}")
+            prepare_args+=(--fantom "${FANTOM_TSS}")
+            # FANTOM5-hg38 fair peaks supply the width regression target via
+            # spatial overlap with positives. Optional — TSS classifier still
+            # trains without it, just no width head.
+            if [ -f "${FANTOM_FAIR}" ]; then
+                prepare_args+=(--fantom-fair "${FANTOM_FAIR}")
+            fi
         else
             prepare_args+=(--polyadb "${POLYADB}")
             if [ -f "${POLYADB_PAS}" ]; then
                 prepare_args+=(--polyadb-pas "${POLYADB_PAS}")
             fi
         fi
-        # GTF is now required by both types: TSS uses it for proximity context,
+        # GTF is needed by both types: TSS uses it for proximity context,
         # TTS uses it for hard negatives sampled from inside gene bodies.
         if [ -f "${GTF}" ]; then
             prepare_args+=(--gtf "${GTF}")
