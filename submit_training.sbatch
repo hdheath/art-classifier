@@ -1,18 +1,20 @@
 #!/bin/bash
 # =============================================================================
-# flAIr Hybrid Boundary Classifier — SLURM Training Job
+# Artifact Classifier — SLURM Training Job (TSS + TTS, with width regressor)
 # Phoenix cluster | hdheath@ucsc.edu
 #
-# Runs TSS and TTS training sequentially in one job (two steps each):
-#   Step 1: prepare_data.py — feature extraction from GRCh38 genome
-#   Step 2: train.py — XGBoost / LogisticReg / RandomForest with CV
-#   Step 3: evaluate.py — PR/ROC curves, feature importance plots
+# This job runs the full training pipeline end-to-end for both boundary types:
+#   Step 1: prepare_data.py — extract sequence features from GRCh38 around
+#           positives (hg38-verified) + random/hard negatives.
+#   Step 2: train.py — XGBoost / Logistic / RF classifier + (TSS only)
+#           XGBoost width regressor on log1p(width).
+#   Step 3: evaluate.py — PR/ROC curves, feature importance, calibration.
 #
-# Resources:
-#   - Feature extraction: CPU-bound (pysam genome fetches), benefits from
-#     multi-threading (--threads 16). ~200K sites × 2 types ≈ 30-60 min.
-#   - Training: single-node, XGBoost uses all cores via n_jobs=-1.
-#   - Total estimate: 3-5 hours on 16 cores.
+# IMPORTANT: this is the first re-training run after the hg19/hg38 build
+# audit (commit f9e41ac). The previous TSS classifier was trained on
+# hg19 positives evaluated against the hg38 genome — invalid. Any
+# data/derived/*_features.npz files on disk before this run are stale
+# and will be deleted by this script.
 #
 # Submit:
 #   sbatch submit_training.sbatch
@@ -22,83 +24,105 @@
 #   tail -f logs/flAIr_training_<jobid>.out
 # =============================================================================
 
-#SBATCH --job-name=flAIr_train
+#SBATCH --job-name=artclf_train
 #SBATCH --partition=medium
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=08:00:00
-#SBATCH --output=/private/groups/brookslab/hdheath/projects/flAIr/logs/flAIr_training_%j.out
-#SBATCH --error=/private/groups/brookslab/hdheath/projects/flAIr/logs/flAIr_training_%j.err
+#SBATCH --time=10:00:00
+#SBATCH --output=/private/home/hdheath/projects/artifact_classifier/logs/artclf_training_%j.out
+#SBATCH --error=/private/home/hdheath/projects/artifact_classifier/logs/artclf_training_%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=hdheath@ucsc.edu
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths — point at the artifact_classifier repo, NOT the old flAIr tree.
+# Reference databases live on brookslab; the repo links them via TSS_db/
+# and TTS_db/ symlinks.
 # ---------------------------------------------------------------------------
-PROJ=/private/groups/brookslab/hdheath/projects/flAIr
+PROJ=/private/home/hdheath/projects/artifact_classifier
 GENOME=${PROJ}/data/ref/GRCh38.primary_assembly.genome.fa
-GTF=${PROJ}/data/ref/gencode.v48.annotation.gtf
+GTF=${PROJ}/data/ref/gencode.v49.basic.annotation.gtf
 
-FANTOM_TSS=${PROJ}/TSS_db/FANTOM_TSS_human.bed
-REFTSS=${PROJ}/TSS_db/refTSS_v4.1_human_coordinate.hg38.bed.txt
+# TSS sources (all verified hg38 in commit f9e41ac):
+FANTOM_TSS=${PROJ}/TSS_db/FANTOM_TSS_human.hg38.bed                          # positives source
+FANTOM_FAIR=${PROJ}/TSS_db/fantom5_hg38/hg38_fair_CAGE_peaks_phase1and2.bed  # width target source
+
+# TTS sources (verified byte-identical to fresh re-lift):
 POLYADB=${PROJ}/TTS_db/polyadb.hg38.weighted.bed
 POLYADB_PAS=${PROJ}/TTS_db/polyAdb_human.PAS.txt
 
 DATA_DIR=${PROJ}/data/derived
 MODEL_DIR=${PROJ}/model_weights
-EVAL_DIR=${PROJ}/data/derived/eval
+EVAL_DIR=${DATA_DIR}/eval
 SRC=${PROJ}/src/flair_boundary
 
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
-MAX_SITES=200000     # Positive sites per type (200K TSS + 200K TTS)
-NEG_RATIO=3          # 3x negatives per positive → 800K total per type
+MAX_SITES=200000              # Max positive sites per type
+NEG_RATIO=3                   # Negatives per positive
+HARD_NEG_FRAC=0.5             # Half of negatives drawn from inside gene bodies
 CV_FOLDS=5
 HOLDOUT_CHROM=chr22
-THREADS=${SLURM_CPUS_PER_TASK}   # Use all allocated CPUs for feature extraction
+THREADS=${SLURM_CPUS_PER_TASK}
 MODELS="xgboost logistic rf"
 
 # ---------------------------------------------------------------------------
-# Environment
+# Header
 # ---------------------------------------------------------------------------
 echo "============================================================"
-echo "flAIr Hybrid Boundary Classifier Training"
+echo "Artifact Classifier — Training Run"
 echo "============================================================"
-echo "Job ID:     ${SLURM_JOB_ID}"
-echo "Node:       $(hostname)"
-echo "CPUs:       ${SLURM_CPUS_PER_TASK}"
-echo "Memory:     ${SLURM_MEM_PER_NODE}MB"
-echo "Start:      $(date)"
-echo "Genome:     ${GENOME}"
-echo "Max sites:  ${MAX_SITES} pos per type"
-echo "Neg ratio:  ${NEG_RATIO}x"
-echo "Models:     ${MODELS}"
-echo "Holdout:    ${HOLDOUT_CHROM}"
+echo "Job ID:      ${SLURM_JOB_ID}"
+echo "Node:        $(hostname)"
+echo "CPUs:        ${SLURM_CPUS_PER_TASK}"
+echo "Memory:      ${SLURM_MEM_PER_NODE} MB"
+echo "Start:       $(date)"
+echo "Repo:        ${PROJ}"
+echo "Genome:      ${GENOME}"
+echo "GTF:         ${GTF}"
+echo "TSS pos:     ${FANTOM_TSS}"
+echo "TSS width:   ${FANTOM_FAIR}"
+echo "TTS:         ${POLYADB}"
+echo "Max sites:   ${MAX_SITES} pos per type"
+echo "Neg ratio:   ${NEG_RATIO}x  (hard fraction: ${HARD_NEG_FRAC})"
+echo "Holdout:     ${HOLDOUT_CHROM}"
+echo "Models:      ${MODELS}"
 echo "============================================================"
-echo ""
+echo
 
-# Activate conda environment
+# Activate conda env (flair-ml: trained the previous models, has xgboost/sklearn).
 source /private/home/hdheath/miniforge3/etc/profile.d/conda.sh
 conda activate flair-ml
 
-# Verify dependencies
 python -c "import xgboost, pysam, sklearn, numpy, pandas; print('Dependencies OK')"
 
-mkdir -p "${DATA_DIR}" "${MODEL_DIR}" "${EVAL_DIR}"
+mkdir -p "${DATA_DIR}" "${MODEL_DIR}" "${EVAL_DIR}" "${PROJ}/logs"
 
 # ---------------------------------------------------------------------------
-# Helper function: run one boundary type
+# Force regeneration: any cached features.npz from before the hg38 build
+# fix is stale. Delete to be safe.
+# ---------------------------------------------------------------------------
+echo "Deleting any cached *_features.npz to force regeneration with hg38-clean data..."
+for f in "${DATA_DIR}/tss_features.npz" "${DATA_DIR}/tts_features.npz"; do
+    if [ -f "$f" ] || [ -L "$f" ]; then
+        echo "  rm $f"
+        rm -f "$f"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Helper: run one boundary type
 # ---------------------------------------------------------------------------
 run_boundary_type() {
     local BTYPE="$1"
     local T_START=$(date +%s)
 
-    echo ""
+    echo
     echo "============================================================"
     echo "  ${BTYPE^^} — Step 1/3: Feature extraction"
     echo "  $(date)"
@@ -106,40 +130,41 @@ run_boundary_type() {
 
     local FEATURES=${DATA_DIR}/${BTYPE}_features.npz
 
-    if [ -f "${FEATURES}" ]; then
-        echo "  Features already exist: ${FEATURES}"
-        echo "  Delete to regenerate."
+    local PREPARE_ARGS=(
+        --type "${BTYPE}"
+        --genome "${GENOME}"
+        --output "${FEATURES}"
+        --max-sites "${MAX_SITES}"
+        --neg-ratio "${NEG_RATIO}"
+        --hard-neg-frac "${HARD_NEG_FRAC}"
+        --merge-window 25
+        --neg-min-dist 500
+        --threads "${THREADS}"
+    )
+
+    if [ "${BTYPE}" == "tss" ]; then
+        PREPARE_ARGS+=(--fantom "${FANTOM_TSS}")
+        [ -f "${FANTOM_FAIR}" ] && PREPARE_ARGS+=(--fantom-fair "${FANTOM_FAIR}")
     else
-        local PREPARE_ARGS=(
-            --type "${BTYPE}"
-            --genome "${GENOME}"
-            --output "${FEATURES}"
-            --max-sites "${MAX_SITES}"
-            --neg-ratio "${NEG_RATIO}"
-            --merge-window 25
-            --neg-min-dist 500
-            --threads "${THREADS}"
-        )
-
-        if [ "${BTYPE}" == "tss" ]; then
-            PREPARE_ARGS+=(--fantom "${FANTOM_TSS}" --reftss "${REFTSS}")
-        else
-            PREPARE_ARGS+=(--polyadb "${POLYADB}" --polyadb-pas "${POLYADB_PAS}")
-        fi
-
-        # GTF is used for gene-distance context features (both TSS and TTS)
-        [ -f "${GTF}" ] && PREPARE_ARGS+=(--gtf "${GTF}")
-
-        PYTHONPATH=${PROJ}/src python ${SRC}/extract/prepare_data.py "${PREPARE_ARGS[@]}"
+        PREPARE_ARGS+=(--polyadb "${POLYADB}")
+        [ -f "${POLYADB_PAS}" ] && PREPARE_ARGS+=(--polyadb-pas "${POLYADB_PAS}")
     fi
 
-    echo ""
+    # GTF needed for hard negatives (gene-body sampling) and proximity context.
+    [ -f "${GTF}" ] && PREPARE_ARGS+=(--gtf "${GTF}")
+
+    PYTHONPATH=${PROJ}/src python -m flair_boundary.extract.prepare_data "${PREPARE_ARGS[@]}"
+
+    echo
     echo "============================================================"
     echo "  ${BTYPE^^} — Step 2/3: Training models"
     echo "  $(date)"
     echo "============================================================"
 
-    PYTHONPATH=${PROJ}/src python ${SRC}/train/train.py \
+    # --width-model trains the regressor only for TSS (the train.py code
+    # gates this internally — passing it for TTS is a no-op with a log
+    # line saying so).
+    PYTHONPATH=${PROJ}/src python -m flair_boundary.train.train \
         --features "${FEATURES}" \
         --output "${MODEL_DIR}/${BTYPE}" \
         --type "${BTYPE}" \
@@ -147,15 +172,16 @@ run_boundary_type() {
         --cv-folds "${CV_FOLDS}" \
         --holdout-chrom "${HOLDOUT_CHROM}" \
         --feature-importance \
-        --early-stopping 50
+        --early-stopping 50 \
+        --width-model
 
-    echo ""
+    echo
     echo "============================================================"
     echo "  ${BTYPE^^} — Step 3/3: Evaluation"
     echo "  $(date)"
     echo "============================================================"
 
-    PYTHONPATH=${PROJ}/src python ${SRC}/eval/evaluate.py \
+    PYTHONPATH=${PROJ}/src python -m flair_boundary.eval.evaluate \
         --features "${FEATURES}" \
         --model-dir "${MODEL_DIR}/${BTYPE}" \
         --output "${EVAL_DIR}/${BTYPE}" \
@@ -164,14 +190,14 @@ run_boundary_type() {
 
     local T_END=$(date +%s)
     local ELAPSED=$(( (T_END - T_START) / 60 ))
-    echo ""
+    echo
     echo "  ${BTYPE^^} complete in ${ELAPSED} minutes."
     echo "  Models:   ${MODEL_DIR}/${BTYPE}/"
     echo "  Eval:     ${EVAL_DIR}/${BTYPE}/"
 }
 
 # ---------------------------------------------------------------------------
-# Run TSS then TTS
+# Run TSS, then TTS
 # ---------------------------------------------------------------------------
 JOB_START=$(date +%s)
 
@@ -184,24 +210,19 @@ TOTAL=$(( (JOB_END - JOB_START) / 60 ))
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-echo ""
+echo
 echo "============================================================"
 echo "ALL DONE — Total time: ${TOTAL} minutes"
 echo "$(date)"
 echo "============================================================"
-echo ""
-echo "Output summary:"
-echo ""
+echo
 echo "Feature matrices:"
 ls -lh ${DATA_DIR}/*.npz 2>/dev/null || echo "  (none)"
-echo ""
+echo
 echo "Trained models:"
 ls -lh ${MODEL_DIR}/tss/*.pkl ${MODEL_DIR}/tts/*.pkl 2>/dev/null || echo "  (none)"
-echo ""
-echo "Evaluation plots:"
-ls ${EVAL_DIR}/tss/*.png ${EVAL_DIR}/tts/*.png 2>/dev/null | wc -l | xargs echo "  PNG files:"
-echo ""
-echo "Performance summaries:"
+echo
+echo "Evaluation summaries:"
 for f in ${EVAL_DIR}/tss/tss_evaluation_summary.json ${EVAL_DIR}/tts/tts_evaluation_summary.json; do
     if [ -f "$f" ]; then
         echo "  $(basename $f):"
@@ -210,19 +231,22 @@ import json
 with open('$f') as fp:
     d = json.load(fp)
 for model, metrics in d.items():
-    print(f'    {model}: AUROC={metrics.get(\"roc_auc\", 0):.4f}  AUPRC={metrics.get(\"avg_precision\", 0):.4f}  F1={metrics.get(\"f1_optimal\", 0):.4f}')
+    print(f'    {model:<24}  AUROC={metrics.get(\"roc_auc\", 0):.4f}  AUPRC={metrics.get(\"avg_precision\", 0):.4f}  F1={metrics.get(\"f1_optimal\", 0):.4f}')
 "
     fi
 done
-echo ""
-echo "To run inference:"
-echo "  conda activate flair-ml"
-echo "  PYTHONPATH=${PROJ}/src python ${SRC}/infer/infer.py \\"
-echo "      --candidates candidates.bed \\"
-echo "      --genome ${GENOME} \\"
-echo "      --tss-model ${MODEL_DIR}/tss/xgboost.pkl \\"
-echo "      --tts-model ${MODEL_DIR}/tts/xgboost.pkl \\"
-echo "      --bam aligned_reads.bam \\"
-echo "      --type tss \\"
-echo "      --output scored_boundaries.tsv \\"
-echo "      --select"
+echo
+echo "Width regressor (TSS):"
+if [ -f "${MODEL_DIR}/tss/training_metadata.json" ]; then
+    python -c "
+import json
+with open('${MODEL_DIR}/tss/training_metadata.json') as fp:
+    d = json.load(fp)
+w = d.get('width_model')
+if w:
+    h = w.get('holdout_metrics', {})
+    print(f\"  RMSE(log1p)={h.get('rmse_log1p', 0):.4f}  MAE(bp)={h.get('mae_bp', 0):.1f}  median|err|(bp)={h.get('median_ae_bp', 0):.1f}  Spearman r={h.get('spearman_r', 0):.4f}\")
+else:
+    print('  No width regressor metadata')
+"
+fi
