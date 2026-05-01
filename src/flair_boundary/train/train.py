@@ -57,6 +57,24 @@ import xgboost as xgb
 
 MODEL_KEYS = ["xgboost", "logistic", "rf", "xgboost_calibrated"]
 
+# Width regression defaults (separate model, regressor not classifier)
+XGBOOST_WIDTH_DEFAULTS = {
+    "n_estimators": 500,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    # log1p target → squared error in log-space ≈ multiplicative error in bp
+    "objective": "reg:squarederror",
+    "eval_metric": "rmse",
+    "tree_method": "hist",
+    "random_state": 42,
+    "n_jobs": -1,
+}
+
 XGBOOST_DEFAULTS = {
     "n_estimators": 500,
     "max_depth": 6,
@@ -124,6 +142,10 @@ def parse_args():
                    help="XGBoost early stopping rounds (0 = disabled)")
     p.add_argument("--feature-importance", action="store_true",
                    help="Save feature importance rankings after training")
+    p.add_argument("--width-model", action="store_true",
+                   help="Also train a width regressor (positives only) for "
+                        "predicting initiation/termination zone width in bp. "
+                        "Saved as xgboost_width.pkl alongside the classifier.")
 
     return p.parse_args()
 
@@ -140,7 +162,7 @@ def parse_args():
 CTX_FEATURE_PREFIX = "ctx_"
 
 
-def load_features(npz_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+def load_features(npz_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str], np.ndarray]:
     """
     Load feature matrix from .npz file.
 
@@ -150,7 +172,10 @@ def load_features(npz_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np
 
     Returns
     -------
-    X, y, chroms, positions, feature_names
+    X, y, chroms, positions, feature_names, widths
+    `widths` is the regression target for width prediction (peak width in
+    bp for positives, -1 for negatives). Older .npz files without a
+    `widths` array return an all-(-1) vector.
     """
     print(f"Loading features from {npz_file}...")
     data = np.load(npz_file, allow_pickle=True)
@@ -160,6 +185,12 @@ def load_features(npz_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np
     chroms = data["chroms"]
     positions = data["positions"]
     feature_names = list(data["feature_names"])
+    if "widths" in data.files:
+        widths = data["widths"].astype(float)
+    else:
+        widths = np.full(len(y), -1.0, dtype=float)
+        print("  NOTE: .npz has no 'widths' field — width regression disabled "
+              "(re-run prepare_data.py to enable)")
 
     stored_type = str(data["boundary_type"][0])
     print(f"  Boundary type: {stored_type}")
@@ -175,7 +206,7 @@ def load_features(npz_file: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np
         print(f"  Dropped {len(dropped)} ctx features (leakage prevention): {dropped}")
         print(f"  Training features: {X.shape[1]}")
 
-    return X, y, chroms, positions, feature_names
+    return X, y, chroms, positions, feature_names, widths
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +419,19 @@ def train_model(
         cv_metrics = {}
 
     # --- Final fit on full training data ---
+    # NOTE: We deliberately do NOT pass (X_test, y_test) as the early-stopping
+    # eval_set, because X_test is the held-out chromosome reserved for honest
+    # evaluation. Using it for early-stopping would let the model select its
+    # n_estimators against the metric we report, which inflates holdout
+    # numbers. Instead, carve a small validation slice out of the training
+    # set just for early-stopping.
     print("\n  Fitting final model on full training set...")
-    if is_xgboost and args.early_stopping > 0 and X_test is not None:
-        clf.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=100,
+    if is_xgboost and args.early_stopping > 0:
+        from sklearn.model_selection import train_test_split as _tts
+        X_tr, X_es, y_tr, y_es = _tts(
+            X_train, y_train, test_size=0.1, stratify=y_train, random_state=42
         )
+        clf.fit(X_tr, y_tr, eval_set=[(X_es, y_es)], verbose=False)
     else:
         clf.fit(X_train, y_train)
 
@@ -434,6 +471,111 @@ def train_model(
 
 
 # ---------------------------------------------------------------------------
+# Width regression (positives only)
+# ---------------------------------------------------------------------------
+
+def train_width_regressor(
+    X: np.ndarray,
+    y: np.ndarray,
+    widths: np.ndarray,
+    chroms: np.ndarray,
+    feature_names: List[str],
+    output_dir: Path,
+    boundary_type: str,
+    holdout_chrom: str = "",
+) -> Dict:
+    """Train an XGBoost regressor that predicts peak width (bp) from sequence.
+
+    Trained on positives only (negatives have no defined width). Target is
+    log1p(width) so the model handles the long tail of broad CpG-island
+    promoters (sometimes >500bp) without being dominated by them.
+
+    Used at inference by ted.py to set per-locus HDBSCAN tss_slack: broad
+    promoters get a larger clustering radius, narrow TATA-driven TSSs get
+    a tighter one.
+    """
+    pos_mask = (y == 1) & (widths > 0)
+    n_pos = int(pos_mask.sum())
+    if n_pos < 100:
+        print(f"\n  WIDTH REGRESSOR: skipping — only {n_pos} positives with "
+              f"valid widths (need ≥100)")
+        return {}
+
+    print("\n" + "=" * 60)
+    print("Training: WIDTH REGRESSOR (XGBoost)")
+    print("=" * 60)
+
+    Xw = X[pos_mask]
+    yw = np.log1p(widths[pos_mask].astype(float))
+    cw = chroms[pos_mask]
+
+    # Holdout split on chromosome (same as classifier for honest comparison)
+    if holdout_chrom and (cw == holdout_chrom).any():
+        train_mask = cw != holdout_chrom
+        Xw_train, yw_train = Xw[train_mask], yw[train_mask]
+        Xw_test, yw_test = Xw[~train_mask], yw[~train_mask]
+        print(f"  Holdout {holdout_chrom}: {len(yw_test):,} positives held out")
+    else:
+        from sklearn.model_selection import train_test_split as _tts
+        Xw_train, Xw_test, yw_train, yw_test = _tts(
+            Xw, yw, test_size=0.2, random_state=42
+        )
+        print(f"  No holdout chrom available; 80/20 random split")
+
+    print(f"  Train: {len(yw_train):,}  Test: {len(yw_test):,}")
+    print(f"  Width distribution (bp): "
+          f"median={int(np.median(np.expm1(yw_train)))}  "
+          f"p10={int(np.percentile(np.expm1(yw_train), 10))}  "
+          f"p90={int(np.percentile(np.expm1(yw_train), 90))}")
+
+    # Carve early-stopping val out of train (don't leak holdout)
+    from sklearn.model_selection import train_test_split as _tts
+    Xw_tr, Xw_es, yw_tr, yw_es = _tts(
+        Xw_train, yw_train, test_size=0.1, random_state=42
+    )
+
+    params = {**XGBOOST_WIDTH_DEFAULTS, "early_stopping_rounds": 50}
+    reg = xgb.XGBRegressor(**params)
+    reg.fit(Xw_tr, yw_tr, eval_set=[(Xw_es, yw_es)], verbose=False)
+
+    # Evaluate on holdout
+    pred_log = reg.predict(Xw_test)
+    pred_bp = np.expm1(pred_log)
+    true_bp = np.expm1(yw_test)
+    rmse_log = float(np.sqrt(np.mean((pred_log - yw_test) ** 2)))
+    mae_bp = float(np.mean(np.abs(pred_bp - true_bp)))
+    median_ae_bp = float(np.median(np.abs(pred_bp - true_bp)))
+    # Spearman correlation — does the model rank-order narrow vs. broad correctly?
+    from scipy.stats import spearmanr
+    spearman_r, _ = spearmanr(pred_log, yw_test)
+
+    print(f"  Holdout RMSE (log1p):     {rmse_log:.4f}")
+    print(f"  Holdout MAE (bp):         {mae_bp:.1f}")
+    print(f"  Holdout median |err| (bp): {median_ae_bp:.1f}")
+    print(f"  Holdout Spearman r:       {spearman_r:.4f}")
+
+    # Save
+    out_path = output_dir / "xgboost_width.pkl"
+    with open(out_path, "wb") as f:
+        pickle.dump(reg, f)
+    print(f"  Saved: {out_path}")
+
+    return {
+        "model": "xgboost_width",
+        "boundary_type": boundary_type,
+        "n_train": len(yw_train),
+        "n_test": len(yw_test),
+        "holdout_metrics": {
+            "rmse_log1p": rmse_log,
+            "mae_bp": mae_bp,
+            "median_ae_bp": median_ae_bp,
+            "spearman_r": float(spearman_r),
+        },
+        "model_path": str(out_path),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -446,7 +588,7 @@ def main():
     print()
 
     # Load data
-    X, y, chroms, positions, feature_names = load_features(args.features)
+    X, y, chroms, positions, feature_names, widths = load_features(args.features)
 
     # Replace NaN with 0 (shouldn't be many after prepare_data filtering)
     X = np.nan_to_num(X, nan=0.0)
@@ -478,6 +620,19 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Train width regressor (positives only) before classifier loop, so it
+    # uses the full positive set regardless of which classifier variants
+    # are requested.
+    width_result = {}
+    if args.width_model:
+        width_result = train_width_regressor(
+            X=X, y=y, widths=widths, chroms=chroms,
+            feature_names=feature_names,
+            output_dir=out_dir,
+            boundary_type=args.type,
+            holdout_chrom=args.holdout_chrom,
+        )
+
     # Train each requested model
     all_results = []
     for model_name in args.model:
@@ -500,6 +655,7 @@ def main():
         "feature_names": feature_names,
         "holdout_chrom": args.holdout_chrom,
         "models": all_results,
+        "width_model": width_result if width_result else None,
     }
     meta_path = out_dir / "training_metadata.json"
 

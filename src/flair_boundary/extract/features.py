@@ -428,6 +428,104 @@ def load_positive_sites(
     return df[["chrom", "pos", "strand", "score", "label"]].reset_index(drop=True)
 
 
+def generate_hard_negatives(
+    positive_df: pd.DataFrame,
+    gtf_file: str,
+    n_negatives: int,
+    boundary_type: str,
+    min_distance: int = 500,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Generate "hard" negative sites drawn from inside annotated gene bodies.
+
+    The default `generate_negative_sites` samples anywhere on the genome, which
+    means negatives are dominated by intergenic positions and the model can
+    learn "is this in a gene-rich region?" rather than "is this a TSS/TTS?".
+
+    Hard negatives are sampled from inside gene bodies on the same strand,
+    excluding a `min_distance` window around any positive. For TSS, this means
+    "internal exon/intron positions on real genes" — the kind of false-positive
+    candidate ted.py actually has to reject. Same for TTS.
+
+    Parameters
+    ----------
+    positive_df : pd.DataFrame
+        Reference positive sites (chrom, pos, strand).
+    gtf_file : str
+        GENCODE GTF for gene coordinates.
+    n_negatives : int
+        Number of hard negatives to draw.
+    boundary_type : str
+        'tss' or 'tts' — controls how to avoid the actual TSS/TTS region of
+        each gene (we don't want hard negatives that *are* TSSs/TTSs).
+    min_distance : int
+        Minimum distance from any positive site (bp).
+    seed : int
+    """
+    rng = np.random.default_rng(seed)
+
+    # Parse gene records from GTF
+    genes = []
+    with open(gtf_file) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            parts = line.rstrip().split("\t")
+            if len(parts) < 9 or parts[2] != "gene":
+                continue
+            genes.append((parts[0], int(parts[3]) - 1, int(parts[4]), parts[6]))
+    if not genes:
+        print("    WARNING: no genes parsed from GTF; returning empty hard negatives")
+        return pd.DataFrame(columns=["chrom", "pos", "strand", "score", "label"])
+
+    # Per-(chrom, strand) positive position arrays for distance check
+    pos_index: Dict[Tuple[str, str], np.ndarray] = {}
+    for (chrom, strand), grp in positive_df.groupby(["chrom", "strand"]):
+        pos_index[(chrom, strand)] = np.sort(grp["pos"].values)
+
+    # For each gene, compute the "interior" region we can sample from.
+    # Skip the first/last 200bp of the gene to avoid actual TSS/TTS regions.
+    SKIP = 200
+    gene_intervals = []  # (chrom, lo, hi, strand)
+    for chrom, gstart, gend, strand in genes:
+        lo = gstart + SKIP
+        hi = gend - SKIP
+        if hi - lo < 100:
+            continue
+        gene_intervals.append((chrom, lo, hi, strand))
+    if not gene_intervals:
+        return pd.DataFrame(columns=["chrom", "pos", "strand", "score", "label"])
+
+    # Length-weight sampling
+    lengths = np.array([hi - lo for _, lo, hi, _ in gene_intervals], dtype=np.float64)
+    probs = lengths / lengths.sum()
+
+    negatives = []
+    attempts = 0
+    max_attempts = n_negatives * 30
+    while len(negatives) < n_negatives and attempts < max_attempts:
+        attempts += 1
+        gi = int(rng.choice(len(gene_intervals), p=probs))
+        chrom, lo, hi, strand = gene_intervals[gi]
+        pos = int(rng.integers(lo, hi))
+        ref_positions = pos_index.get((chrom, strand))
+        if ref_positions is not None and len(ref_positions) > 0:
+            if np.abs(ref_positions - pos).min() < min_distance:
+                continue
+        negatives.append(
+            {"chrom": chrom, "pos": pos, "strand": strand, "score": 0, "label": 0}
+        )
+
+    if len(negatives) < n_negatives:
+        print(
+            f"    WARNING: only {len(negatives)}/{n_negatives} hard negatives "
+            f"generated after {attempts} attempts (positives may be too dense)"
+        )
+
+    return pd.DataFrame(negatives)
+
+
 def generate_negative_sites(
     positive_df: pd.DataFrame,
     genome_fasta: str,
@@ -465,6 +563,10 @@ def generate_negative_sites(
     chroms = [c for c in fa.references if re.match(r"^chr[0-9XY]+$", c)]
     chrom_lens = {c: fa.get_reference_length(c) for c in chroms}
 
+    # Pre-compute weighted-by-length sampling probs once (was inside the loop)
+    total_len = sum(chrom_lens.values())
+    probs = np.array([chrom_lens[c] / total_len for c in chroms])
+
     # Build positive set for distance checking (chrom -> sorted positions)
     pos_by_chrom: Dict[str, np.ndarray] = {}
     for chrom, grp in positive_df.groupby("chrom"):
@@ -476,25 +578,23 @@ def generate_negative_sites(
 
     while len(negatives) < n_negatives and attempts < max_attempts:
         attempts += 1
-
-        # Random chromosome weighted by length
-        total_len = sum(chrom_lens.values())
-        probs = np.array([chrom_lens[c] / total_len for c in chroms])
         chrom = rng.choice(chroms, p=probs)
-
-        # Random position
         pos = int(rng.integers(1000, chrom_lens[chrom] - 1000))
 
-        # Check distance from positives on this chromosome
         if chrom in pos_by_chrom:
             dists = np.abs(pos_by_chrom[chrom] - pos)
             if dists.min() < min_distance:
                 continue
 
-        # Random strand
         strand = rng.choice(["+", "-"])
-
         negatives.append({"chrom": chrom, "pos": pos, "strand": strand, "score": 0, "label": 0})
+
+    if len(negatives) < n_negatives:
+        print(
+            f"    WARNING: only {len(negatives)}/{n_negatives} negatives generated "
+            f"after {attempts} attempts; consider relaxing min_distance "
+            f"(currently {min_distance}bp)"
+        )
 
     fa.close()
     return pd.DataFrame(negatives)

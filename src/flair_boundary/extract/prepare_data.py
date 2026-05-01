@@ -42,6 +42,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from flair_boundary.extract.features import (
     SequenceFeatureExtractor,
+    generate_hard_negatives,
     generate_negative_sites,
     load_positive_sites,
 )
@@ -80,6 +81,10 @@ def parse_args():
                    help="Merge sites within this distance (bp, default: 25)")
     p.add_argument("--neg-min-dist", type=int, default=500,
                    help="Min distance of negatives from positives (bp)")
+    p.add_argument("--hard-neg-frac", type=float, default=0.5,
+                   help="Fraction of negatives drawn from inside annotated gene "
+                        "bodies (hard negatives). 0 = no hard negatives, 1 = all "
+                        "hard negatives. Requires --gtf. Default: 0.5")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for negative sampling")
     p.add_argument("--threads", type=int, default=1,
@@ -97,11 +102,34 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 def load_fantom_tss(bed_file: str, min_score: float = 0) -> pd.DataFrame:
-    """Load FANTOM TSS BED (already hg38, BED9 with confidence in name)."""
+    """Load FANTOM TSS BED (BED9, hg38).
+
+    Boundary coordinate is the **peak summit** (BED `thickStart`), not the
+    interval edge. CAGE peaks span 5–50bp; using `start`/`end-1` biases the
+    label away from the actual TSS by half the peak width.
+    """
     print(f"  Loading FANTOM TSS: {bed_file}")
-    df = pd.read_csv(bed_file, sep="\t", header=None, comment="t",
-                     names=["chrom", "start", "end", "name", "score", "strand",
-                            "thickStart", "thickEnd", "rgb"])
+    # NOTE: comment="#" — the previous comment="t" silently dropped any line
+    # whose first character was 't'. Skip the optional "track ..." header
+    # explicitly with skiprows-on-error.
+    try:
+        df = pd.read_csv(
+            bed_file, sep="\t", header=None, comment="#",
+            names=["chrom", "start", "end", "name", "score", "strand",
+                   "thickStart", "thickEnd", "rgb"],
+        )
+    except pd.errors.ParserError:
+        df = pd.read_csv(
+            bed_file, sep="\t", header=None, comment="#", skiprows=1,
+            names=["chrom", "start", "end", "name", "score", "strand",
+                   "thickStart", "thickEnd", "rgb"],
+        )
+    # Drop any leftover header rows (defensive)
+    df = df[df["start"].apply(lambda x: str(x).isdigit())]
+    df[["start", "end", "thickStart", "thickEnd"]] = df[
+        ["start", "end", "thickStart", "thickEnd"]
+    ].astype(int)
+
     # Parse confidence from name "p1@GENE,0.1352"
     def parse_conf(name):
         if "," in str(name):
@@ -115,28 +143,38 @@ def load_fantom_tss(bed_file: str, min_score: float = 0) -> pd.DataFrame:
     if min_score > 0:
         df = df[df["conf"] >= min_score]
 
-    # TSS position: start for +, end-1 for -
-    df["pos"] = df.apply(
-        lambda r: r["start"] if r["strand"] == "+" else r["end"] - 1, axis=1
-    )
+    # Use BED `thickStart` as the peak summit — strand-aware: thickStart is
+    # already the dominant TSS position for the peak and is the same field
+    # used by FANTOM's own tools.
+    df["pos"] = df["thickStart"].astype(int)
     df["score"] = (df["conf"] * 1000).astype(int)
     df["label"] = 1
-    print(f"    → {len(df):,} sites")
-    return df[["chrom", "pos", "strand", "score", "label"]]
+    # Peak width (end - start) — used as a regression target for width prediction.
+    # FANTOM CAGE peak width reflects the breadth of the initiation zone:
+    # narrow (TATA-driven, sharp) vs. broad (CpG-island promoters).
+    df["width"] = (df["end"].astype(int) - df["start"].astype(int)).clip(lower=1)
+    print(f"    → {len(df):,} sites (using thickStart summit, "
+          f"median width={df['width'].median():.0f}bp)")
+    return df[["chrom", "pos", "strand", "score", "label", "width"]]
 
 
 def load_reftss(bed_file: str) -> pd.DataFrame:
-    """Load refTSS BED (hg38, tab-separated with header)."""
+    """Load refTSS BED (hg38, tab-separated with header).
+
+    Boundary coordinate is the **interval midpoint**, not the strand-edge.
+    refTSS peaks are 50–500bp wide and there is no annotated summit — the
+    midpoint is the least-biased point estimate.
+    """
     print(f"  Loading refTSS: {bed_file}")
     df = pd.read_csv(bed_file, sep="\t")
     df = df.rename(columns={"chromosome": "chrom", "refTSS_ID": "name"})
-    df["pos"] = df.apply(
-        lambda r: r["start"] if r["strand"] == "+" else r["end"] - 1, axis=1
-    )
+    df["pos"] = ((df["start"].astype(int) + df["end"].astype(int)) // 2).astype(int)
     df["score"] = 1000  # All refTSS are high-confidence
     df["label"] = 1
-    print(f"    → {len(df):,} sites")
-    return df[["chrom", "pos", "strand", "score", "label"]]
+    df["width"] = (df["end"].astype(int) - df["start"].astype(int)).clip(lower=1)
+    print(f"    → {len(df):,} sites (using interval midpoint, "
+          f"median width={df['width'].median():.0f}bp)")
+    return df[["chrom", "pos", "strand", "score", "label", "width"]]
 
 
 def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
@@ -155,6 +193,9 @@ def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
         lambda r: r["end"] - 1 if r["strand"] == "+" else r["start"], axis=1
     )
     df["label"] = 1
+    # Peak width — typically narrow for polyA sites (often 1bp), but some
+    # broad clusters exist. Used as a regression target.
+    df["width"] = (df["end"].astype(int) - df["start"].astype(int)).clip(lower=1)
 
     if pas_file:
         print(f"  Merging PAS annotations from: {pas_file}")
@@ -179,14 +220,20 @@ def load_polyadb(bed_file: str, pas_file: Optional[str] = None) -> pd.DataFrame:
         for col in ["intron_exon_loc", "pse"]:
             if col in pas_df.columns:
                 merge_cols.append(col)
-        df = df.merge(pas_df[merge_cols], on="name", how="left")
+        # Dedup PAS_ID before merging — duplicate IDs would multiply BED rows
+        # and silently inflate the positive count.
+        n_before = len(pas_df)
+        pas_df = pas_df.drop_duplicates(subset="name", keep="first")
+        if len(pas_df) < n_before:
+            print(f"    Dropped {n_before - len(pas_df)} duplicate PAS_IDs before merge")
+        df = df.merge(pas_df[merge_cols], on="name", how="left", validate="many_to_one")
         df["score"] = df["pas_score"].fillna(df["score"]).astype(int)
 
-    print(f"    → {len(df):,} sites")
+    print(f"    → {len(df):,} sites (median width={df['width'].median():.0f}bp)")
     # NOTE: intron_exon_loc and pse columns from polyAdb are NOT included
     # in the training feature set — they cause label leakage because they
     # are only non-zero for positive sites (from the database).
-    return df[["chrom", "pos", "strand", "score", "label"]]
+    return df[["chrom", "pos", "strand", "score", "label", "width"]]
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +274,10 @@ def merge_sites(dfs: list, window: int = 25) -> pd.DataFrame:
 
     result = pd.DataFrame(merged).reset_index(drop=True)
     result["label"] = 1
-    return result[["chrom", "pos", "strand", "score", "label"]]
+    cols = ["chrom", "pos", "strand", "score", "label"]
+    if "width" in result.columns:
+        cols.append("width")
+    return result[cols]
 
 
 # ---------------------------------------------------------------------------
@@ -551,17 +601,52 @@ def main():
     # not trivially 0 for all negatives. 150bp keeps negatives clearly
     # separated from positives while allowing some to land near real boundaries.
     effective_neg_min_dist = min(args.neg_min_dist, 150)
-    print(f"\n[2/4] Generating {args.neg_ratio}x negatives ({args.neg_ratio * len(positives):,} sites, "
+    n_total_neg = args.neg_ratio * len(positives)
+
+    use_hard = args.hard_neg_frac > 0 and getattr(args, "gtf", None) and Path(args.gtf).exists()
+    if use_hard:
+        n_hard = int(round(n_total_neg * args.hard_neg_frac))
+        n_easy = n_total_neg - n_hard
+    else:
+        if args.hard_neg_frac > 0:
+            print(
+                f"  NOTE: --hard-neg-frac={args.hard_neg_frac} requires --gtf; "
+                f"falling back to all easy negatives"
+            )
+        n_hard, n_easy = 0, n_total_neg
+
+    print(f"\n[2/4] Generating {n_total_neg:,} negatives "
+          f"({n_easy:,} random + {n_hard:,} hard, "
           f"min_dist={effective_neg_min_dist}bp)...")
-    negatives = generate_negative_sites(
-        positive_df=positives,
-        genome_fasta=args.genome,
-        n_negatives=args.neg_ratio * len(positives),
-        min_distance=effective_neg_min_dist,
-        seed=args.seed,
-    )
-    negatives = negatives[~negatives["chrom"].isin(excluded_chroms)]
-    print(f"  Generated {len(negatives):,} negative sites")
+
+    neg_dfs = []
+    if n_easy > 0:
+        df_easy = generate_negative_sites(
+            positive_df=positives,
+            genome_fasta=args.genome,
+            n_negatives=n_easy,
+            min_distance=effective_neg_min_dist,
+            seed=args.seed,
+        )
+        df_easy = df_easy[~df_easy["chrom"].isin(excluded_chroms)]
+        neg_dfs.append(df_easy)
+        print(f"  Random negatives:  {len(df_easy):,}")
+
+    if n_hard > 0:
+        df_hard = generate_hard_negatives(
+            positive_df=positives,
+            gtf_file=args.gtf,
+            n_negatives=n_hard,
+            boundary_type=args.type,
+            min_distance=effective_neg_min_dist,
+            seed=args.seed + 1,
+        )
+        df_hard = df_hard[~df_hard["chrom"].isin(excluded_chroms)]
+        neg_dfs.append(df_hard)
+        print(f"  Hard (gene-body) negatives: {len(df_hard):,}")
+
+    negatives = pd.concat(neg_dfs, ignore_index=True) if neg_dfs else pd.DataFrame()
+    print(f"  Total negatives: {len(negatives):,}")
 
     # Combine
     all_sites = pd.concat([positives, negatives], ignore_index=True)
@@ -606,6 +691,13 @@ def main():
     chroms = all_sites_valid["chrom"].values
     positions = all_sites_valid["pos"].values
     strands = all_sites_valid["strand"].values
+    # Width is the regression target for the width head. NaN for negatives
+    # (they have no defined initiation/termination zone width). Stored
+    # separately from y so the regressor can be trained on positives only.
+    if "width" in all_sites_valid.columns:
+        widths = all_sites_valid["width"].astype(float).fillna(-1).values
+    else:
+        widths = np.full(len(all_sites_valid), -1.0, dtype=float)
 
     # --- Get feature names ---
     extractor = SequenceFeatureExtractor(args.genome, args.type)
@@ -628,6 +720,7 @@ def main():
         chroms=chroms,
         positions=positions,
         strands=strands,
+        widths=widths,
         feature_names=np.array(feature_names),
         boundary_type=np.array([args.type]),
     )

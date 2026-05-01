@@ -135,14 +135,16 @@ run_type() {
 
         if [ "${btype}" == "tss" ]; then
             prepare_args+=(--fantom "${FANTOM_TSS}" --reftss "${REFTSS}")
-            if [ -f "${GTF}" ]; then
-                prepare_args+=(--gtf "${GTF}")
-            fi
         else
             prepare_args+=(--polyadb "${POLYADB}")
             if [ -f "${POLYADB_PAS}" ]; then
                 prepare_args+=(--polyadb-pas "${POLYADB_PAS}")
             fi
+        fi
+        # GTF is now required by both types: TSS uses it for proximity context,
+        # TTS uses it for hard negatives sampled from inside gene bodies.
+        if [ -f "${GTF}" ]; then
+            prepare_args+=(--gtf "${GTF}")
         fi
 
         python "${SRC}/extract/prepare_data.py" "${prepare_args[@]}"
@@ -160,7 +162,8 @@ run_type() {
         --cv-folds "${CV_FOLDS}" \
         --holdout-chrom "${HOLDOUT_CHROM}" \
         --feature-importance \
-        --early-stopping 50
+        --early-stopping 50 \
+        --width-model
 
     # ---- Step 3: Evaluate ----
     echo ""
