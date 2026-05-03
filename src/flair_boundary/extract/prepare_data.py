@@ -527,8 +527,12 @@ def compute_genomic_location_features(
         gene_df = pd.DataFrame(genes)
         print(f"    Loaded {len(gene_df):,} gene records")
 
-        # For each site, find nearest gene on same chromosome
-        for (chrom,), grp_sites in all_sites.groupby(["chrom"]):
+        # For each site, find nearest gene on same chromosome.
+        # NB: use a scalar groupby key (not a 1-element list) so the loop
+        # variable receives the chrom directly on both pandas 1.x (py3.10)
+        # and pandas 2.x (py3.11+). The list form returns a 1-tuple key
+        # only on the newer version.
+        for chrom, grp_sites in all_sites.groupby("chrom"):
             chrom_genes = gene_df[gene_df["chrom"] == chrom]
             if chrom_genes.empty:
                 continue

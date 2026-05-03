@@ -95,11 +95,26 @@ echo "Models:      ${MODELS}"
 echo "============================================================"
 echo
 
-# Activate conda env (flair-ml: trained the previous models, has xgboost/sklearn).
+# Use the flair-ml conda env's interpreter directly. SLURM nodes have a
+# system Python 3.10 (pandas 1.5) on PATH; `conda activate` inside a
+# non-interactive job doesn't reliably shadow it. Calling the env's
+# python by absolute path guarantees we get pandas 2.x / py3.11.
 source /private/home/hdheath/miniforge3/etc/profile.d/conda.sh
 conda activate flair-ml
+PY=/private/home/hdheath/miniforge3/envs/flair-ml/bin/python
 
-python -c "import xgboost, pysam, sklearn, numpy, pandas; print('Dependencies OK')"
+# Sanity-check we got the right interpreter, not the system one.
+which_py=$($PY -c "import sys; print(sys.executable)")
+py_ver=$($PY -c "import sys; print(sys.version_info[:2])")
+pd_ver=$($PY -c "import pandas; print(pandas.__version__)")
+echo "Interpreter: $which_py"
+echo "Python:      $py_ver"
+echo "Pandas:      $pd_ver"
+if [[ "$which_py" != *"flair-ml"* ]]; then
+    echo "ERROR: not running inside flair-ml env" >&2
+    exit 1
+fi
+$PY -c "import xgboost, pysam, sklearn, numpy, pandas; print('Dependencies OK')"
 
 mkdir -p "${DATA_DIR}" "${MODEL_DIR}" "${EVAL_DIR}" "${PROJ}/logs"
 
@@ -153,7 +168,7 @@ run_boundary_type() {
     # GTF needed for hard negatives (gene-body sampling) and proximity context.
     [ -f "${GTF}" ] && PREPARE_ARGS+=(--gtf "${GTF}")
 
-    PYTHONPATH=${PROJ}/src python -m flair_boundary.extract.prepare_data "${PREPARE_ARGS[@]}"
+    PYTHONPATH=${PROJ}/src $PY -m flair_boundary.extract.prepare_data "${PREPARE_ARGS[@]}"
 
     echo
     echo "============================================================"
@@ -164,7 +179,7 @@ run_boundary_type() {
     # --width-model trains the regressor only for TSS (the train.py code
     # gates this internally — passing it for TTS is a no-op with a log
     # line saying so).
-    PYTHONPATH=${PROJ}/src python -m flair_boundary.train.train \
+    PYTHONPATH=${PROJ}/src $PY -m flair_boundary.train.train \
         --features "${FEATURES}" \
         --output "${MODEL_DIR}/${BTYPE}" \
         --type "${BTYPE}" \
@@ -181,7 +196,7 @@ run_boundary_type() {
     echo "  $(date)"
     echo "============================================================"
 
-    PYTHONPATH=${PROJ}/src python -m flair_boundary.eval.evaluate \
+    PYTHONPATH=${PROJ}/src $PY -m flair_boundary.eval.evaluate \
         --features "${FEATURES}" \
         --model-dir "${MODEL_DIR}/${BTYPE}" \
         --output "${EVAL_DIR}/${BTYPE}" \
@@ -226,7 +241,7 @@ echo "Evaluation summaries:"
 for f in ${EVAL_DIR}/tss/tss_evaluation_summary.json ${EVAL_DIR}/tts/tts_evaluation_summary.json; do
     if [ -f "$f" ]; then
         echo "  $(basename $f):"
-        python -c "
+        $PY -c "
 import json
 with open('$f') as fp:
     d = json.load(fp)
@@ -238,7 +253,7 @@ done
 echo
 echo "Width regressor (TSS):"
 if [ -f "${MODEL_DIR}/tss/training_metadata.json" ]; then
-    python -c "
+    $PY -c "
 import json
 with open('${MODEL_DIR}/tss/training_metadata.json') as fp:
     d = json.load(fp)
