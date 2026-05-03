@@ -92,6 +92,10 @@ def load_features(npz_file: str) -> Tuple:
     chroms = data["chroms"]
     positions = data["positions"]
     feature_names = list(data["feature_names"])
+    # widths: per-row promoter-region width in bp; sentinel value -1 for
+    # rows without a FANTOM5-fair overlap. Used only by the width
+    # regressor evaluation; classifier metrics ignore it.
+    widths = data["widths"].astype(float) if "widths" in data.files else None
 
     # Drop ctx_* features (same as train.py)
     keep_mask = [not name.startswith(CTX_FEATURE_PREFIX) for name in feature_names]
@@ -101,7 +105,7 @@ def load_features(npz_file: str) -> Tuple:
         feature_names = [n for n in feature_names if not n.startswith(CTX_FEATURE_PREFIX)]
         print(f"  Dropped {len(dropped)} ctx features: {dropped}")
 
-    return X, y, chroms, positions, feature_names
+    return X, y, chroms, positions, feature_names, widths
 
 
 def load_models(model_dir: Path, model_names: Optional[List[str]] = None) -> Dict:
@@ -387,7 +391,7 @@ def main():
     print()
 
     # Load features
-    X, y, chroms, positions, feature_names = load_features(args.features)
+    X, y, chroms, positions, feature_names, widths = load_features(args.features)
     X = np.nan_to_num(X, nan=0.0)
 
     # Split holdout
@@ -396,14 +400,17 @@ def main():
         if mask.sum() == 0:
             print(f"WARNING: Chromosome {args.holdout_chrom} not found in data. Using all.")
             X_test, y_test, chroms_test = X, y, chroms
+            widths_test = widths
         else:
             X_test = X[mask]
             y_test = y[mask]
             chroms_test = chroms[mask]
+            widths_test = widths[mask] if widths is not None else None
             print(f"Using holdout chromosome {args.holdout_chrom}: "
                   f"{mask.sum():,} sites ({(y_test==1).sum():,} pos, {(y_test==0).sum():,} neg)")
     else:
         X_test, y_test, chroms_test = X, y, chroms
+        widths_test = widths
         print(f"Evaluating on all data: {len(X_test):,} sites")
 
     # Load models
@@ -419,12 +426,18 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Evaluate all models
-    print(f"\nEvaluating {len(models)} models...")
+    # Split classifiers vs the (optional) width regressor. The width
+    # regressor predicts continuous bp widths and has no .predict_proba();
+    # it gets evaluated separately below with regression metrics.
+    width_models = {n: m for n, m in models.items() if n.endswith("_width")}
+    classifier_models = {n: m for n, m in models.items() if not n.endswith("_width")}
+
+    # Evaluate classifiers
+    print(f"\nEvaluating {len(classifier_models)} classifier(s)...")
     model_metrics = {}
     all_results = {}
 
-    for name, clf in models.items():
+    for name, clf in classifier_models.items():
         print(f"\n  {name}:")
         metrics = compute_full_metrics(clf, X_test, y_test, args.threshold)
         model_metrics[name] = metrics
@@ -447,6 +460,40 @@ def main():
         # Feature importance
         plot_feature_importance(clf, feature_names, args.type, name, out_dir)
         plot_per_chrom_performance(chrom_df, args.type, name, out_dir)
+
+    # Width regressor evaluation (TSS only; trained against the FANTOM5
+    # fair-peak overlap widths). Uses regression metrics — RMSE in log1p
+    # space (training scale), MAE in bp, Spearman r — and ignores rows
+    # with no width label (sentinel value -1).
+    if width_models and widths_test is not None:
+        print(f"\nEvaluating {len(width_models)} width regressor(s)...")
+        labelled = (widths_test > 0) & (y_test == 1)
+        n_labelled = int(labelled.sum())
+        if n_labelled < 10:
+            print(f"  Skipping: only {n_labelled} holdout positives have a width label")
+        else:
+            X_w = X_test[labelled]
+            w_true = widths_test[labelled]
+            log_w_true = np.log1p(w_true)
+            for name, reg in width_models.items():
+                log_w_pred = reg.predict(X_w)
+                w_pred = np.expm1(log_w_pred)
+                rmse_log = float(np.sqrt(np.mean((log_w_pred - log_w_true) ** 2)))
+                mae_bp = float(np.mean(np.abs(w_pred - w_true)))
+                med_ae_bp = float(np.median(np.abs(w_pred - w_true)))
+                # Spearman correlation
+                from scipy.stats import spearmanr
+                rho, _ = spearmanr(w_pred, w_true)
+                print(f"  {name}:  n={n_labelled}  RMSE(log1p)={rmse_log:.4f}  "
+                      f"MAE={mae_bp:.1f}bp  median|err|={med_ae_bp:.1f}bp  "
+                      f"Spearman r={rho:.4f}")
+                all_results[name] = {
+                    "n_labelled_holdout": n_labelled,
+                    "rmse_log1p": rmse_log,
+                    "mae_bp": mae_bp,
+                    "median_ae_bp": med_ae_bp,
+                    "spearman_r": float(rho),
+                }
 
     # Combined plots
     print("\nGenerating combined plots...")
